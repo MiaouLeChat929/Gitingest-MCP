@@ -32,7 +32,7 @@ async def git_summary(
 		summary = ingester.get_summary()
 
 		try: # Try to fetch README.md
-			readme_content = ingester.get_content(["README.md"])
+			readme_content = await ingester.get_content(["README.md"])
 			if readme_content and "README.md" in readme_content:
 				summary = f"{summary}\n\n{readme_content}"
 		except Exception:
@@ -95,7 +95,7 @@ async def git_files(
 		await ingester.fetch_repo_data()
 		
 		# Get the requested file contents
-		files_content = ingester.get_content(file_paths)
+		files_content = await ingester.get_content(file_paths)
 		if not files_content:
 			return {
 				"error": f"None of the requested files were found in the repository"
