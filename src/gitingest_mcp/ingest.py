@@ -56,6 +56,8 @@ class GitIngester:
             if success:
                 self._fetched_from_zip = True
                 return
+            else:
+                self._set_fallback_summary("Failed to fetch repository: ZIP archive unavailable")
         except Exception as e:
             logger.error(f"Failed to fetch via ZIP: {e}")
             self._set_fallback_summary(f"Failed to fetch repository: {str(e)}")

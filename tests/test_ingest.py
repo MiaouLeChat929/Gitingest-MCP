@@ -65,10 +65,12 @@ async def test_fallback_mechanism(mocker, respx_mock):
     # Test fallback content fetching via raw URL
     # Even if main branch ZIP failed, the fallback for direct file fetch
     # will still try main branch first unless we change it manually
-    respx_mock.get("https://raw.githubusercontent.com/puravparab/gitingest-mcp/main/README.md").mock(
+    # However, `ingester.branch` gets updated to `master` during the ZIP/API fallback
+    # when `main` returned 404, so we must mock `master`
+    respx_mock.get("https://raw.githubusercontent.com/puravparab/gitingest-mcp/master/README.md").mock(
         return_value=httpx.Response(200, text="# Mocked README\nThis is a mocked fallback.")
     )
-    respx_mock.get("https://raw.githubusercontent.com/puravparab/gitingest-mcp/main/missing.txt").mock(
+    respx_mock.get("https://raw.githubusercontent.com/puravparab/gitingest-mcp/master/missing.txt").mock(
         return_value=httpx.Response(404, text="Not Found")
     )
 
