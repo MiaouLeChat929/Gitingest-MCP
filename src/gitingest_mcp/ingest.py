@@ -1,7 +1,11 @@
 import re
 import asyncio
+import httpx
+import logging
 from gitingest import ingest
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger('gitingest-mcp')
 
 class GitIngester:
 	def __init__(self, url: str, branch: Optional[str] = None):
@@ -17,11 +21,24 @@ class GitIngester:
 	async def fetch_repo_data(self) -> None:
 		"""Asynchronously fetch and process repository data."""
 		# Run the synchronous ingest function in a thread pool
-		loop = asyncio.get_event_loop()
-		summary, self.tree, self.content = await loop.run_in_executor(
-			None, lambda: ingest(self.url)
-		)
-		self.summary = self._parse_summary(summary)
+		try:
+			loop = asyncio.get_running_loop()
+			summary, self.tree, self.content = await loop.run_in_executor(
+				None, lambda: ingest(self.url)
+			)
+			self.summary = self._parse_summary(summary)
+			self._is_fallback = False
+		except Exception as e:
+			logger.warning(f"Failed to ingest repository via gitingest: {e}. Enabling fallback mode.")
+			self._is_fallback = True
+			self.summary = {
+				"repository": self.url.split('github.com/')[-1].split('/tree/')[0] if 'github.com' in self.url else "",
+				"num_files": None,
+				"token_count": "",
+				"raw": f"Repository: {self.url}\n(Fallback mode active due to rate limiting/error)"
+			}
+			self.tree = "Directory structure unavailable in fallback mode."
+			self.content = None
 
 	def _parse_summary(self, summary_str: str) -> Dict[str, Any]:
 		"""Parse the summary string into a structured dictionary."""
@@ -61,17 +78,62 @@ class GitIngester:
 
 	def get_summary(self) -> str:
 		"""Returns the repository summary."""
-		return self.summary["raw"]
+		return self.summary["raw"] if self.summary else ""
 
 	def get_tree(self) -> Any:
 		"""Returns the repository tree structure."""
 		return self.tree
 
-	def get_content(self, file_paths: Optional[List[str]] = None) -> str:
+	async def get_content(self, file_paths: Optional[List[str]] = None) -> str:
 		"""Returns the repository content."""
 		if file_paths is None:
-			return self.content
+			return self.content or "No content available."
+
+		if getattr(self, '_is_fallback', False):
+			return await self._fetch_raw_files(file_paths)
+
 		return self._get_files_content(file_paths)
+
+	async def _fetch_raw_files(self, file_paths: List[str]) -> str:
+		"""Fallback method to fetch files directly from GitHub using raw URLs."""
+		base_url = self.url
+		if base_url.endswith("/"):
+			base_url = base_url[:-1]
+
+		# Parse the GitHub URL to get owner, repo, and branch
+		# Format: https://github.com/owner/repo or https://github.com/owner/repo/tree/branch
+		match = re.search(r"github\.com/([^/]+)/([^/]+)(?:/tree/([^/]+))?", base_url)
+		if not match:
+			return f"Error: Cannot parse GitHub URL for fallback: {self.url}"
+
+		owner, repo, url_branch = match.groups()
+
+		# Prefer branch from URL regex, then self.branch, then default to "main"
+		branch = url_branch or getattr(self, "branch", None) or "main"
+
+		raw_base_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/"
+
+		concatenated = ""
+		async with httpx.AsyncClient() as client:
+			for path in file_paths:
+				# Clean up path to avoid double slashes
+				clean_path = path.lstrip("/")
+				url = f"{raw_base_url}{clean_path}"
+				try:
+					response = await client.get(url, follow_redirects=True)
+					response.raise_for_status()
+					content = response.text
+
+					if concatenated:
+						concatenated += "\n\n"
+					concatenated += f"==================================================\nFile: {path}\n==================================================\n{content}"
+				except Exception as e:
+					logger.error(f"Failed to fetch {path} via raw URL: {e}")
+					# Don't fail completely, just skip or note the error for this file
+
+		if not concatenated:
+			return "Could not retrieve content for the specified files."
+		return concatenated
 
 	def _get_files_content(self, file_paths: List[str]) -> str:
 		"""Helper function to extract specific files from repository content."""
