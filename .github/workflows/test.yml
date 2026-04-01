@@ -1,39 +1,44 @@
-name: Test
+name: Run Pytest
 
 on:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
   pull_request:
-    branches:
-      - main
+    branches: [ "main" ]
+
+permissions:
+  contents: read
 
 jobs:
   test:
-    name: Run Pytest
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version-file: "pyproject.toml"
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version-file: "pyproject.toml"
 
-      - name: Install dependencies
-        run: uv sync --dev
+    - name: Install dependencies
+      run: uv sync --dev
 
-      - name: Run tests with pytest
-        run: uv run pytest tests/ --cov=src/gitingest_mcp --cov-report=xml
+    - name: Run Pytest
+      run: uv run pytest tests/ --cov=src/gitingest_mcp --cov-report=xml
 
-      - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          slug: puravparab/gitingest-mcp
+    - name: Run MCP Schema Inspector Validation
+      run: uv run python scripts/inspector_ci.py
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+        fail_ci_if_error: false
+        files: ./coverage.xml
+        name: codecov-umbrella
+        verbose: true
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
