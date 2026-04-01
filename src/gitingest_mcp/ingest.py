@@ -2,191 +2,251 @@ import re
 import asyncio
 import httpx
 import logging
-from gitingest import ingest
-from typing import Any, Dict, List, Optional
+import zipfile
+import io
+import fnmatch
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger('gitingest-mcp')
 
 class GitIngester:
-	def __init__(self, url: str, branch: Optional[str] = None):
-		"""Initialize the GitIngester with a repository URL."""
-		self.url: str = url
-		self.branch: Optional[str] = branch
-		if branch:
-			self.url = f"{url}/tree/{branch}"
-		self.summary: Optional[Dict[str, Any]] = None
-		self.tree: Optional[Any] = None
-		self.content: Optional[Any] = None
+    def __init__(self, url: str, branch: Optional[str] = None):
+        """Initialize the GitIngester with a repository URL."""
+        self.url: str = url
+        self.branch: Optional[str] = branch
 
-	async def fetch_repo_data(self) -> None:
-		"""Asynchronously fetch and process repository data."""
-		# Run the synchronous ingest function in a thread pool
-		try:
-			loop = asyncio.get_running_loop()
-			summary, self.tree, self.content = await loop.run_in_executor(
-				None, lambda: ingest(self.url)
-			)
-			self.summary = self._parse_summary(summary)
-			self._is_fallback = False
-		except Exception as e:
-			logger.warning(f"Failed to ingest repository via gitingest: {e}. Enabling fallback mode.")
-			self._is_fallback = True
-			self.summary = {
-				"repository": self.url.split('github.com/')[-1].split('/tree/')[0] if 'github.com' in self.url else "",
-				"num_files": None,
-				"token_count": "",
-				"raw": f"Repository: {self.url}\n(Fallback mode active due to rate limiting/error)"
-			}
-			self.tree = "Directory structure unavailable in fallback mode."
-			self.content = None
+        # Parse the GitHub URL to get owner and repo
+        match = re.search(r"github\.com/([^/]+)/([^/]+)(?:/tree/([^/]+))?", self.url)
+        if match:
+            self.owner, self.repo, url_branch = match.groups()
+            if url_branch and not self.branch:
+                self.branch = url_branch
+        else:
+            self.owner = ""
+            self.repo = ""
 
-	def _parse_summary(self, summary_str: str) -> Dict[str, Any]:
-		"""Parse the summary string into a structured dictionary."""
-		summary_dict = {}
+        if not self.branch:
+            self.branch = "main" # Default, though we might want to check the default branch
 
-		try:
-			# Extract repository name
-			repo_match = re.search(r"Repository: (.+)", summary_str)
-			if repo_match:
-				summary_dict["repository"] = repo_match.group(1).strip()
-			else:
-				summary_dict["repository"] = ""
+        self.summary: Optional[Dict[str, Any]] = None
+        self.tree: Optional[str] = None
+        self.files_content: Dict[str, str] = {}
 
-			# Extract files analyzed
-			files_match = re.search(r"Files analyzed: (\d+)", summary_str)
-			if files_match:
-				summary_dict["num_files"] = int(files_match.group(1))
-			else:
-				summary_dict["num_files"] = None
+        self._fetched_from_api = False
+        self._fetched_from_zip = False
 
-			# Extract estimated tokens
-			tokens_match = re.search(r"Estimated tokens: (.+)", summary_str)
-			if tokens_match:
-				summary_dict["token_count"] = tokens_match.group(1).strip()
-			else:
-				summary_dict["token_count"] = ""
-								
-		except Exception:
-			# If any regex operation fails, set default values
-			summary_dict["repository"] = ""
-			summary_dict["num_files"] = None
-			summary_dict["token_count"] = ""
+    async def fetch_repo_data(self) -> None:
+        """Asynchronously fetch and process repository data. Try efficient API first, then ZIP if rate limited."""
+        if not self.owner or not self.repo:
+            self._set_fallback_summary("Invalid GitHub URL")
+            return
 
-		# Store the original string as well
-		summary_dict["raw"] = summary_str
-		return summary_dict
+        try:
+            # 1. Try to fetch the tree using the GitHub REST API (fastest if not rate limited)
+            success = await self._fetch_via_api()
+            if success:
+                self._fetched_from_api = True
+                return
+        except Exception as e:
+            logger.warning(f"Failed to fetch via API: {e}")
 
-	def get_summary(self) -> str:
-		"""Returns the repository summary."""
-		return self.summary["raw"] if self.summary else ""
+        # 2. Fallback to downloading the ZIP archive
+        try:
+            success = await self._fetch_via_zip()
+            if success:
+                self._fetched_from_zip = True
+                return
+            else:
+                self._set_fallback_summary("Failed to fetch repository: ZIP archive unavailable")
+        except Exception as e:
+            logger.error(f"Failed to fetch via ZIP: {e}")
+            self._set_fallback_summary(f"Failed to fetch repository: {str(e)}")
 
-	def get_tree(self) -> Any:
-		"""Returns the repository tree structure."""
-		return self.tree
+    def _set_fallback_summary(self, reason: str):
+        self.summary = {
+            "repository": f"{self.owner}/{self.repo}" if self.owner else self.url,
+            "num_files": None,
+            "token_count": "",
+            "raw": f"Repository: {self.owner}/{self.repo}\n(Status: {reason})"
+        }
+        self.tree = f"Directory structure unavailable. Reason: {reason}"
 
-	async def get_content(self, file_paths: Optional[List[str]] = None) -> str:
-		"""Returns the repository content."""
-		if file_paths is None:
-			return self.content or "No content available."
+    async def _fetch_via_api(self) -> bool:
+        """Fetch repository tree via GitHub REST API."""
+        api_url = f"https://api.github.com/repos/{self.owner}/{self.repo}/git/trees/{self.branch}?recursive=1"
 
-		if getattr(self, '_is_fallback', False):
-			return await self._fetch_raw_files(file_paths)
+        async with httpx.AsyncClient() as client:
+            response = await client.get(api_url, follow_redirects=True, headers={"Accept": "application/vnd.github.v3+json"})
 
-		return self._get_files_content(file_paths)
+            if response.status_code == 404:
+                # Might be a different default branch, try 'master' if 'main' fails
+                if self.branch == 'main':
+                    self.branch = 'master'
+                    api_url = f"https://api.github.com/repos/{self.owner}/{self.repo}/git/trees/{self.branch}?recursive=1"
+                    response = await client.get(api_url, follow_redirects=True, headers={"Accept": "application/vnd.github.v3+json"})
 
-	async def _fetch_raw_files(self, file_paths: List[str]) -> str:
-		"""Fallback method to fetch files directly from GitHub using raw URLs."""
-		base_url = self.url
-		if base_url.endswith("/"):
-			base_url = base_url[:-1]
+            if response.status_code != 200:
+                return False
 
-		# Parse the GitHub URL to get owner, repo, and branch
-		# Format: https://github.com/owner/repo or https://github.com/owner/repo/tree/branch
-		match = re.search(r"github\.com/([^/]+)/([^/]+)(?:/tree/([^/]+))?", base_url)
-		if not match:
-			return f"Error: Cannot parse GitHub URL for fallback: {self.url}"
+            data = response.json()
+            if "tree" not in data:
+                return False
 
-		owner, repo, url_branch = match.groups()
+            # Build tree representation
+            tree_lines = []
+            file_count = 0
+            for item in data["tree"]:
+                path = item["path"]
+                if item["type"] == "tree":
+                    tree_lines.append(f"{path}/")
+                else:
+                    tree_lines.append(path)
+                    file_count += 1
 
-		# Prefer branch from URL regex, then self.branch, then default to "main"
-		branch = url_branch or getattr(self, "branch", None) or "main"
+            self.tree = "\n".join(sorted(tree_lines))
 
-		raw_base_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/"
+            self.summary = {
+                "repository": f"{self.owner}/{self.repo}",
+                "num_files": file_count,
+                "token_count": "Unknown (API mode)",
+                "raw": f"Repository: {self.owner}/{self.repo}\nFiles analyzed: {file_count}\nEstimated tokens: Unknown"
+            }
+            return True
 
-		concatenated = ""
-		async with httpx.AsyncClient() as client:
-			for path in file_paths:
-				# Clean up path to avoid double slashes
-				clean_path = path.lstrip("/")
-				url = f"{raw_base_url}{clean_path}"
-				try:
-					response = await client.get(url, follow_redirects=True)
-					response.raise_for_status()
-					content = response.text
+    async def _fetch_via_zip(self) -> bool:
+        """Download and extract the repository ZIP file."""
+        zip_url = f"https://github.com/{self.owner}/{self.repo}/archive/refs/heads/{self.branch}.zip"
 
-					if concatenated:
-						concatenated += "\n\n"
-					concatenated += f"==================================================\nFile: {path}\n==================================================\n{content}"
-				except Exception as e:
-					logger.error(f"Failed to fetch {path} via raw URL: {e}")
-					# Don't fail completely, just skip or note the error for this file
+        async with httpx.AsyncClient() as client:
+            response = await client.get(zip_url, follow_redirects=True)
 
-		if not concatenated:
-			return "Could not retrieve content for the specified files."
-		return concatenated
+            if response.status_code == 404 and self.branch == 'main':
+                self.branch = 'master'
+                zip_url = f"https://github.com/{self.owner}/{self.repo}/archive/refs/heads/{self.branch}.zip"
+                response = await client.get(zip_url, follow_redirects=True)
 
-	def _get_files_content(self, file_paths: List[str]) -> str:
-		"""Helper function to extract specific files from repository content."""
-		result = {}
-		for path in file_paths:
-			result[path] = None
-		if not self.content:
-			return result
-		# Get the content as a string
-		content_str = str(self.content)
+            if response.status_code != 200:
+                return False
 
-		# Try multiple patterns to match file content sections
-		patterns = [
-			# Standard pattern with exactly 50 equals signs
-			r"={50}\nFile: ([^\n]+)\n={50}",
-			# More flexible pattern with varying number of equals signs
-			r"={10,}\nFile: ([^\n]+)\n={10,}",
-			# Extra flexible pattern
-			r"=+\s*File:\s*([^\n]+)\s*\n=+",
-		]
+            # Read zip file from memory
+            try:
+                with zipfile.ZipFile(io.BytesIO(response.content)) as zip_ref:
+                    # Find the root directory name in the zip (usually repo-branch/)
+                    file_list = zip_ref.namelist()
+                    if not file_list:
+                        return False
 
-		for pattern in patterns:
-			# Find all matches in the content
-			matches = re.finditer(pattern, content_str)
-			matched = False
-			for match in matches:
-				matched = True
-				# Get the position of the match
-				start_pos = match.end()
-				filename = match.group(1).strip()
-				# Find the next file header or end of string
-				next_match = re.search(pattern, content_str[start_pos:])
-				if next_match:
-					end_pos = start_pos + next_match.start()
-					file_content = content_str[start_pos:end_pos].strip()
-				else:
-					file_content = content_str[start_pos:].strip()
+                    root_dir = file_list[0].split('/')[0] + '/'
 
-				# Check if this file matches any of the requested paths
-				for path in file_paths:
-					basename = path.split("/")[-1]
-					if path == filename or basename == filename or path.endswith("/" + filename):
-						result[path] = file_content
-			
-			# If we found matches with this pattern, no need to try others
-			if matched:
-				break
+                    tree_lines = []
+                    file_count = 0
+                    total_chars = 0
 
-		# Concatenate all found file contents with file headers
-		concatenated = ""
-		for path, content in result.items():
-			if content is not None:
-				if concatenated:
-					concatenated += "\n\n"
-				concatenated += f"==================================================\nFile: {path}\n==================================================\n{content}"
-		return concatenated
+                    for zip_info in zip_ref.filelist:
+                        # Skip directories and remove root_dir prefix
+                        if zip_info.filename.endswith('/'):
+                            # Add directory to tree, ignoring the root wrapper
+                            if zip_info.filename != root_dir:
+                                tree_lines.append(zip_info.filename[len(root_dir):])
+                            continue
+
+                        # It's a file
+                        clean_path = zip_info.filename[len(root_dir):]
+                        tree_lines.append(clean_path)
+                        file_count += 1
+
+                        # Read content to cache and count roughly for tokens
+                        # We only read text files or files we can decode
+                        try:
+                            content_bytes = zip_ref.read(zip_info.filename)
+                            content_str = content_bytes.decode('utf-8')
+                            self.files_content[clean_path] = content_str
+                            total_chars += len(content_str)
+                        except UnicodeDecodeError:
+                            # Skip binary files or non-utf-8
+                            pass
+
+                    self.tree = "\n".join(sorted(tree_lines))
+
+                    # Rough token estimation (1 token ≈ 4 characters)
+                    tokens = total_chars // 4
+
+                    self.summary = {
+                        "repository": f"{self.owner}/{self.repo}",
+                        "num_files": file_count,
+                        "token_count": str(tokens),
+                        "raw": f"Repository: {self.owner}/{self.repo}\nFiles analyzed: {file_count}\nEstimated tokens: {tokens}"
+                    }
+                    return True
+            except zipfile.BadZipFile:
+                return False
+
+    def get_summary(self) -> str:
+        """Returns the repository summary."""
+        return self.summary["raw"] if self.summary else ""
+
+    def get_tree(self) -> Any:
+        """Returns the repository tree structure."""
+        return self.tree
+
+    async def get_content(self, file_paths: Optional[List[str]] = None) -> str:
+        """Returns the repository content."""
+        if not file_paths:
+            return "No specific files requested."
+
+        # If we downloaded the ZIP, we have all text content in memory
+        if self._fetched_from_zip:
+            return self._get_files_content_from_cache(file_paths)
+
+        # Otherwise, fetch directly via raw GitHub URLs
+        return await self._fetch_raw_files(file_paths)
+
+    def _get_files_content_from_cache(self, file_paths: List[str]) -> str:
+        concatenated = ""
+        for path in file_paths:
+            # Handle exact match or basename match
+            matched_content = None
+            matched_path = None
+
+            for cached_path, content in self.files_content.items():
+                if cached_path == path or cached_path.endswith("/" + path) or path.endswith("/" + cached_path):
+                    matched_content = content
+                    matched_path = cached_path
+                    break
+
+            if matched_content is not None:
+                if concatenated:
+                    concatenated += "\n\n"
+                concatenated += f"==================================================\nFile: {matched_path}\n==================================================\n{matched_content}"
+
+        if not concatenated:
+            return "Could not retrieve content for the specified files."
+        return concatenated
+
+    async def _fetch_raw_files(self, file_paths: List[str]) -> str:
+        """Fallback method to fetch files directly from GitHub using raw URLs."""
+        if not self.owner or not self.repo:
+            return "Error: Cannot parse GitHub URL to fetch raw files."
+
+        raw_base_url = f"https://raw.githubusercontent.com/{self.owner}/{self.repo}/{self.branch}/"
+
+        concatenated = ""
+        async with httpx.AsyncClient() as client:
+            for path in file_paths:
+                clean_path = path.lstrip("/")
+                url = f"{raw_base_url}{clean_path}"
+                try:
+                    response = await client.get(url, follow_redirects=True)
+                    if response.status_code == 200:
+                        content = response.text
+                        if concatenated:
+                            concatenated += "\n\n"
+                        concatenated += f"==================================================\nFile: {path}\n==================================================\n{content}"
+                    else:
+                        logger.warning(f"Failed to fetch {path} via raw URL: Status {response.status_code}")
+                except Exception as e:
+                    logger.error(f"Failed to fetch {path} via raw URL: {e}")
+
+        if not concatenated:
+            return "Could not retrieve content for the specified files."
+        return concatenated

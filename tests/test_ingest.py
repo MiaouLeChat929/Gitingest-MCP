@@ -1,20 +1,19 @@
 import pytest
+import httpx
 from gitingest_mcp.ingest import GitIngester
 
-# Basic test against a small, real repository to test the happy path without mocks
 @pytest.mark.asyncio
-async def test_real_repo_fetch():
-    # We use a very small repo to keep tests fast and avoid rate limiting
+async def test_real_repo_fetch_api():
+    # Using the real repository to test API approach
     url = "https://github.com/puravparab/gitingest-mcp"
     ingester = GitIngester(url)
 
     await ingester.fetch_repo_data()
 
-    # Check that we didn't fall back
-    assert not getattr(ingester, '_is_fallback', False)
+    assert getattr(ingester, '_fetched_from_api', False) is True
 
     summary = ingester.get_summary()
-    assert "Repository:" in summary
+    assert "Repository: puravparab/gitingest-mcp" in summary
     assert "Files analyzed:" in summary
 
     tree = ingester.get_tree()
@@ -22,50 +21,56 @@ async def test_real_repo_fetch():
     assert isinstance(tree, str)
     assert "README.md" in tree
 
-    # Check file content
+    # Check file content (will fallback to raw since we fetched via API)
     content = await ingester.get_content(["README.md"])
     assert "gitingest-mcp" in content.lower()
     assert "README.md" in content
 
 @pytest.mark.asyncio
-async def test_real_repo_fetch_branch():
-    url = "https://github.com/puravparab/gitingest-mcp"
-    ingester = GitIngester(url, branch="main")
-
-    await ingester.fetch_repo_data()
-    assert not getattr(ingester, '_is_fallback', False)
-
-    content = await ingester.get_content(["README.md"])
-    assert "gitingest-mcp" in content.lower()
-
-@pytest.mark.asyncio
 async def test_fallback_mechanism(mocker, respx_mock):
-    # Mock ingest to simulate rate-limiting or generic failure
-    mocker.patch('gitingest_mcp.ingest.ingest', side_effect=Exception("Rate limit exceeded"))
+    # Mock API to fail (e.g., rate limit)
+    respx_mock.get("https://api.github.com/repos/puravparab/gitingest-mcp/git/trees/main?recursive=1").mock(
+        return_value=httpx.Response(403, json={"message": "API rate limit exceeded"})
+    )
+
+    # Master branch API fallback
+    respx_mock.get("https://api.github.com/repos/puravparab/gitingest-mcp/git/trees/master?recursive=1").mock(
+        return_value=httpx.Response(403, json={"message": "API rate limit exceeded"})
+    )
+
+    # Mock ZIP download to fail as well
+    respx_mock.get("https://github.com/puravparab/gitingest-mcp/archive/refs/heads/main.zip").mock(
+        return_value=httpx.Response(404, text="Not Found")
+    )
+
+    # Master branch ZIP fallback to fail
+    respx_mock.get("https://github.com/puravparab/gitingest-mcp/archive/refs/heads/master.zip").mock(
+        return_value=httpx.Response(404, text="Not Found")
+    )
 
     url = "https://github.com/puravparab/gitingest-mcp"
     ingester = GitIngester(url, branch="main")
 
-    # This should fail gracefully and enable fallback mode
     await ingester.fetch_repo_data()
-    assert getattr(ingester, '_is_fallback', False) is True
 
-    # Summary should indicate fallback
+    assert getattr(ingester, '_fetched_from_api', False) is False
+    assert getattr(ingester, '_fetched_from_zip', False) is False
+
     summary = ingester.get_summary()
-    assert "Fallback mode active" in summary
+    assert "Status: Failed to fetch repository" in summary
 
-    # Tree should indicate unavailable
     tree = ingester.get_tree()
-    assert "unavailable in fallback mode" in tree
-
-    import httpx
+    assert "Directory structure unavailable" in tree
 
     # Test fallback content fetching via raw URL
-    # Intercept httpx requests to raw.githubusercontent.com
-    respx_mock.get("https://raw.githubusercontent.com/puravparab/gitingest-mcp/main/README.md").mock(
+    # Even if main branch ZIP failed, the fallback for direct file fetch
+    # will still try main branch first unless we change it manually
+    # However, `ingester.branch` gets updated to `master` during the ZIP/API fallback
+    # when `main` returned 404, so we must mock `master`
+    respx_mock.get("https://raw.githubusercontent.com/puravparab/gitingest-mcp/master/README.md").mock(
         return_value=httpx.Response(200, text="# Mocked README\nThis is a mocked fallback.")
     )
-    respx_mock.get("https://raw.githubusercontent.com/puravparab/gitingest-mcp/main/missing.txt").mock(
+    respx_mock.get("https://raw.githubusercontent.com/puravparab/gitingest-mcp/master/missing.txt").mock(
         return_value=httpx.Response(404, text="Not Found")
     )
 
@@ -74,46 +79,27 @@ async def test_fallback_mechanism(mocker, respx_mock):
     # Assert successful fetch
     assert "File: README.md" in content
     assert "Mocked README" in content
-
-    # missing.txt should not be present in output, since it 404s
     assert "File: missing.txt" not in content
 
 @pytest.mark.asyncio
-async def test_parse_summary():
-    ingester = GitIngester("https://github.com/test/repo")
+async def test_get_files_content_from_zip_cache():
+    url = "https://github.com/test/repo"
+    ingester = GitIngester(url)
 
-    summary_str = "Repository: test/repo\nFiles analyzed: 42\nEstimated tokens: 1234\n"
-    summary_dict = ingester._parse_summary(summary_str)
+    # Manually simulate zip fetch cache
+    ingester._fetched_from_zip = True
+    ingester.files_content = {
+        "test.py": "print('hello world')",
+        "README.md": "# Hello"
+    }
 
-    assert summary_dict["repository"] == "test/repo"
-    assert summary_dict["num_files"] == 42
-    assert summary_dict["token_count"] == "1234"
-    assert summary_dict["raw"] == summary_str
-
-@pytest.mark.asyncio
-async def test_parse_summary_invalid():
-    ingester = GitIngester("https://github.com/test/repo")
-
-    summary_str = "Invalid summary format without expected fields"
-    summary_dict = ingester._parse_summary(summary_str)
-
-    assert summary_dict["repository"] == ""
-    assert summary_dict["num_files"] is None
-    assert summary_dict["token_count"] == ""
-    assert summary_dict["raw"] == summary_str
-
-@pytest.mark.asyncio
-async def test_get_files_content():
-    ingester = GitIngester("https://github.com/test/repo")
-    ingester.content = "==================================================\nFile: test.py\n==================================================\nprint('hello world')\n\n==================================================\nFile: README.md\n==================================================\n# Hello"
-
-    # Test specific file retrieval via regex patterns
     content = await ingester.get_content(["test.py"])
     assert "test.py" in content
     assert "hello world" in content
     assert "README.md" not in content
 
-    # Test getting all content when no file paths are specified
-    content_all = await ingester.get_content()
-    assert "test.py" in content_all
-    assert "README.md" in content_all
+    content_multiple = await ingester.get_content(["test.py", "README.md"])
+    assert "test.py" in content_multiple
+    assert "hello world" in content_multiple
+    assert "README.md" in content_multiple
+    assert "# Hello" in content_multiple
