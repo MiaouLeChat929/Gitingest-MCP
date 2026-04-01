@@ -79,7 +79,7 @@ class GitIngester:
 		for path in file_paths:
 			result[path] = None
 		if not self.content:
-			return result
+			return ""
 		# Get the content as a string
 		content_str = str(self.content)
 
